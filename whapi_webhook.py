@@ -15,6 +15,9 @@ from google_sheets import sync_all_to_google_sheets
 load_dotenv()
 
 app = Flask(__name__)
+@app.get("/healthz")
+def healthz():
+    return {"status": "ok"}, 200
 SEEN_MESSAGE_IDS: set[str] = set()
 logger = logging.getLogger(__name__)
 
