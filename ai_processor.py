@@ -1,10 +1,12 @@
 import json
 import os
+import re
 from enum import Enum
 from typing import Any
 
 from dotenv import load_dotenv
-from pydantic import BaseModel, Field, field_validator
+from openai import OpenAI
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from covering_cases import extract_covering_cases
 from parser import parse_whatsapp_export
@@ -33,7 +35,41 @@ class UrgencyLevel(str, Enum):
     UNKNOWN = "UNKNOWN"
 
 
+_APPROVER_ALIASES = (
+    ("Mehta Ji SPM Dv Bsp Site", "Mehta Ji SPM Dv Bsp Site"),
+    ("Gagan Deep Singh", "Gagan Deep Singh"),
+    ("Jagga Rao Sir", "Jagga Rao"),
+    ("Deep Patel Sir", "Deep Patel"),
+    ("Mehta Ji", "Mehta Ji SPM Dv Bsp Site"),
+    ("Mehta Sir", "Mehta Ji SPM Dv Bsp Site"),
+    ("Jagga Sir", "Jagga Rao"),
+    ("Jagga Rao", "Jagga Rao"),
+    ("Gagan Sir", "Gagan Deep Singh"),
+    ("Deep Sir", "Deep Patel"),
+    ("Deep Patel", "Deep Patel"),
+    ("Mukesh Sir", "Mukesh"),
+    ("Mukesh", "Mukesh"),
+)
+
+
+def _canonical_approver_name(value: str) -> str | None:
+    normalized = re.sub(r"[^a-z0-9]+", " ", value.casefold()).strip()
+    for alias, canonical_name in _APPROVER_ALIASES:
+        alias_normalized = re.sub(r"[^a-z0-9]+", " ", alias.casefold()).strip()
+        if normalized == alias_normalized:
+            return canonical_name
+    return None
+
+
 class ParticipantInterpretation(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={
+            "additionalProperties": False,
+            "required": ["person", "status", "last_message"],
+        },
+    )
+
     person: str = Field(..., min_length=1)
     status: ParticipantStatus
     last_message: str = Field(..., min_length=1)
@@ -47,6 +83,14 @@ class ParticipantInterpretation(BaseModel):
 
 
 class CaseInterpretation(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={
+            "additionalProperties": False,
+            "required": ["covering_number", "description", "urgency", "participants", "overall_status"],
+        },
+    )
+
     covering_number: str = Field(..., min_length=1)
     description: str | None = None
     urgency: UrgencyLevel = UrgencyLevel.UNKNOWN
@@ -84,13 +128,13 @@ class CaseInterpretation(BaseModel):
 
 
 def get_gemini_model_name() -> str:
-    return os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
+    return os.getenv("GROQ_MODEL", "qwen/qwen3.8-27b")
 
 
 def _require_api_key() -> str:
-    api_key = os.getenv("GEMINI_API_KEY")
+    api_key = os.getenv("GROQ_API_KEY")
     if not api_key:
-        raise ValueError("GEMINI_API_KEY is not set. Add it to the environment or .env file.")
+        raise ValueError("GROQ_API_KEY is not set. Add it to the environment or .env file.")
     return api_key
 
 
@@ -130,6 +174,8 @@ def _build_prompt(case: dict[str, Any]) -> str:
             "- Use APPROVED only for clear approval/confirmation language.",
             "- Use REJECTED only for clear rejection language.",
             "- If a person clearly says ok/okay/approved/yes/confirmed/done, set status to OK or APPROVED depending on wording and context.",
+            "- If a message says 'approved by [name]' or '[name] approved', attribute the approval to the named person, not the message sender.",
+            "- Normalize named approvers: Mukesh/Mukesh Sir to Mukesh; Mehta Sir/Mehta Ji to Mehta Ji SPM Dv Bsp Site; Jagga Sir/Jagga Rao Sir to Jagga Rao; Gagan Sir/Gagan Deep Singh to Gagan Deep Singh; Deep Sir/Deep Patel Sir to Deep Patel.",
             "- If they say will check / checking / will confirm / not yet / let me verify, use PENDING.",
             "- If the description is unclear, set description to null.",
             "- Use uppercase values only.",
@@ -141,7 +187,7 @@ def _build_prompt(case: dict[str, Any]) -> str:
 
 def _extract_response_payload(response: Any) -> dict[str, Any]:
     if response is None:
-        raise ValueError("Gemini response was empty.")
+        raise ValueError("AI response was empty.")
 
     if hasattr(response, "parsed") and response.parsed is not None:
         parsed = response.parsed
@@ -150,51 +196,61 @@ def _extract_response_payload(response: Any) -> dict[str, Any]:
         if hasattr(parsed, "model_dump"):
             return parsed.model_dump()
 
+    choices = getattr(response, "choices", None)
+    if choices:
+        choice = choices[0]
+        message = getattr(choice, "message", None)
+        text = getattr(message, "content", None)
+        if isinstance(text, str) and text.strip():
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError:
+                raise ValueError("Groq returned non-JSON content.")
+
     text = getattr(response, "text", None)
-    if text:
+    if isinstance(text, str) and text.strip():
         try:
             return json.loads(text)
         except json.JSONDecodeError:
-            raise ValueError("Gemini returned non-JSON content.")
+            raise ValueError("Groq returned non-JSON content.")
 
-    if hasattr(response, "candidates") and response.candidates:
-        candidate = response.candidates[0]
-        if hasattr(candidate, "content"):
-            parts = getattr(candidate.content, "parts", [])
-            if parts:
-                part_text = getattr(parts[0], "text", None)
-                if part_text:
-                    return json.loads(part_text)
+    if hasattr(response, "output_text") and response.output_text:
+        try:
+            return json.loads(response.output_text)
+        except json.JSONDecodeError:
+            raise ValueError("Groq returned non-JSON content.")
 
-    raise ValueError("Could not interpret Gemini response payload.")
+    raise ValueError("Could not interpret Groq response payload.")
 
 
 def call_gemini(case: dict[str, Any], client: Any | None = None, model_name: str | None = None) -> dict[str, Any]:
-    """Call Gemini for the covering case using structured JSON output."""
-    if client is not None and not hasattr(client, "models"):
+    """Call Groq's OpenAI-compatible API for the covering case using structured JSON output."""
+    if client is not None and not hasattr(client, "chat"):
         return _extract_response_payload(client)
 
     if client is None:
-        try:
-            from google import genai
-        except ImportError as exc:  # pragma: no cover
-            raise RuntimeError("google-genai is required for Gemini integration.") from exc
-
         api_key = _require_api_key()
-        client = genai.Client(api_key=api_key)
+        client = OpenAI(
+            api_key=api_key,
+            base_url="https://api.groq.com/openai/v1",
+        )
 
     model = model_name or get_gemini_model_name()
     prompt = _build_prompt(case)
 
-    config = {
-        "response_mime_type": "application/json",
-        "response_schema": CaseInterpretation.model_json_schema(),
-    }
-
-    response = client.models.generate_content(
+    response = client.chat.completions.create(
         model=model,
-        contents=prompt,
-        config=config,
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=2048,
+        temperature=0,
+        response_format={
+            "type": "json_schema",
+            "json_schema": {
+                "name": "case_interpretation",
+                "schema": CaseInterpretation.model_json_schema(),
+                "strict": True,
+            },
+        },
     )
     return _extract_response_payload(response)
 
@@ -202,7 +258,62 @@ def call_gemini(case: dict[str, Any], client: Any | None = None, model_name: str
 def interpret_covering_case(case: dict[str, Any], gemini_client: Any | None = None) -> CaseInterpretation:
     """Interpret a single covering case into a validated, structured result."""
     raw_response = call_gemini(case, client=gemini_client)
-    return CaseInterpretation.model_validate(raw_response)
+    interpretation = CaseInterpretation.model_validate(raw_response)
+    explicit_approvals: dict[str, tuple[str, str]] = {}
+
+    for message in case.get("messages", []):
+        text = str(message.get("text") or "")
+        for alias, canonical_name in _APPROVER_ALIASES:
+            alias_pattern = r"\s+".join(re.escape(part) for part in alias.split())
+            if re.search(rf"\bapproved\s+by\s+{alias_pattern}\b", text, re.IGNORECASE) or re.search(
+                rf"\b{alias_pattern}\s+(?:has\s+)?approved\b", text, re.IGNORECASE
+            ):
+                explicit_approvals[canonical_name] = (str(message.get("sender") or ""), text)
+                break
+
+    if not explicit_approvals:
+        return interpretation
+
+    participants = [
+        participant
+        for participant in interpretation.participants
+        if not any(
+            participant.person.strip().casefold() == sender.strip().casefold()
+            and participant.status in {ParticipantStatus.APPROVED, ParticipantStatus.OK}
+            and participant.last_message.strip().casefold() == text.strip().casefold()
+            for sender, text in explicit_approvals.values()
+        )
+    ]
+
+    for canonical_name, (_, text) in explicit_approvals.items():
+        matching_participant = next(
+            (
+                participant
+                for participant in participants
+                if _canonical_approver_name(participant.person) == canonical_name
+            ),
+            None,
+        )
+        if matching_participant:
+            matching_participant.person = canonical_name
+            matching_participant.status = ParticipantStatus.APPROVED
+            matching_participant.last_message = text
+            participants = [
+                participant
+                for participant in participants
+                if participant is matching_participant
+                or _canonical_approver_name(participant.person) != canonical_name
+            ]
+        else:
+            participants.append(
+                ParticipantInterpretation(
+                    person=canonical_name,
+                    status=ParticipantStatus.APPROVED,
+                    last_message=text,
+                )
+            )
+
+    return interpretation.model_copy(update={"participants": participants})
 
 
 def interpret_cases(cases: list[dict[str, Any]], gemini_client: Any | None = None) -> list[CaseInterpretation]:

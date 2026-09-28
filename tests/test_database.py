@@ -1,7 +1,7 @@
 import pytest
 from pydantic import ValidationError
 
-from ai_processor import OverallStatus, ParticipantStatus
+from ai_processor import CaseInterpretation, OverallStatus, ParticipantInterpretation, ParticipantStatus
 from database import save_case, upsert_case, upsert_participant, insert_message, get_or_create_case, load_environment
 
 
@@ -170,6 +170,137 @@ def test_accepts_enum_values_from_ai_model_dump():
     result = upsert_participant(client, "case-1", participant)
 
     assert result["status"] == ParticipantStatus.APPROVED.value
+
+
+def test_one_approval_keeps_case_pending():
+    client = FakeClient()
+    case_payload = {
+        "covering_number": "401",
+        "description": "contractor payment",
+        "urgency": "NORMAL",
+        "participants": [{"person": "Mukesh", "status": ParticipantStatus.APPROVED.value, "last_message": "Approved"}],
+        "messages": [{"timestamp": "2024-01-02T09:00:00", "sender": "Mukesh", "text": "Approved"}],
+    }
+
+    result = save_case(client, case_payload)
+
+    assert result["overall_status"] == OverallStatus.PENDING.value
+
+
+@pytest.mark.parametrize("person", ["Suyash", "Deep Patel"])
+def test_ai_approved_with_only_one_participant_persists_pending(person):
+    client = FakeClient()
+    interpretation = CaseInterpretation(
+        covering_number="405",
+        description="Covering 405 approved",
+        participants=[ParticipantInterpretation(person=person, status=ParticipantStatus.APPROVED, last_message="Approved")],
+        overall_status=OverallStatus.APPROVED,
+    )
+
+    result = save_case(
+        client,
+        {
+            "covering_number": "405",
+            "participants": [
+                {"person": person, "status": ParticipantStatus.APPROVED.value, "last_message": "Approved"}
+            ],
+        },
+        interpretation,
+    )
+
+    assert result["overall_status"] == OverallStatus.PENDING.value
+    assert client.cases.last_upsert["overall_status"] == OverallStatus.PENDING.value
+
+
+def test_existing_approved_case_is_downgraded_when_only_one_required_approves():
+    client = FakeClient()
+    case_payload = {
+        "covering_number": "259",
+        "participants": [
+            {"person": "Mukesh", "status": ParticipantStatus.APPROVED.value, "last_message": "Approved"}
+        ],
+    }
+
+    result = save_case(client, case_payload)
+
+    assert result["overall_status"] == OverallStatus.PENDING.value
+    assert client.cases.last_upsert["overall_status"] == OverallStatus.PENDING.value
+
+
+def test_four_approvals_keeps_case_pending():
+    client = FakeClient()
+    case_payload = {
+        "covering_number": "402",
+        "description": "contractor payment",
+        "urgency": "NORMAL",
+        "participants": [
+            {"person": "Mukesh", "status": ParticipantStatus.APPROVED.value, "last_message": "Approved"},
+            {"person": "Mehta Ji SPM Dv Bsp Site", "status": ParticipantStatus.APPROVED.value, "last_message": "Approved"},
+            {"person": "Jagga Rao", "status": ParticipantStatus.APPROVED.value, "last_message": "Approved"},
+            {"person": "Gagan Deep Singh", "status": ParticipantStatus.APPROVED.value, "last_message": "Approved"},
+        ],
+        "messages": [{"timestamp": "2024-01-02T09:00:00", "sender": name, "text": "Approved"} for name in ["Mukesh", "Mehta Ji SPM Dv Bsp Site", "Jagga Rao", "Gagan Deep Singh"]],
+    }
+
+    result = save_case(client, case_payload)
+
+    assert result["overall_status"] == OverallStatus.PENDING.value
+
+
+def test_all_five_required_approvals_approve_case():
+    client = FakeClient()
+    case_payload = {
+        "covering_number": "403",
+        "description": "contractor payment",
+        "urgency": "NORMAL",
+        "participants": [
+            {"person": "Mukesh", "status": ParticipantStatus.APPROVED.value, "last_message": "Approved"},
+            {"person": "Mehta Ji SPM Dv Bsp Site", "status": ParticipantStatus.APPROVED.value, "last_message": "Approved"},
+            {"person": "Jagga Rao", "status": ParticipantStatus.APPROVED.value, "last_message": "Approved"},
+            {"person": "Gagan Deep Singh", "status": ParticipantStatus.APPROVED.value, "last_message": "Approved"},
+            {"person": "Deep Patel", "status": ParticipantStatus.APPROVED.value, "last_message": "Approved"},
+        ],
+        "messages": [{"timestamp": f"2024-01-02T09:{i:02d}:00", "sender": person, "text": "Approved"} for i, person in enumerate([
+            "Mukesh",
+            "Mehta Ji SPM Dv Bsp Site",
+            "Jagga Rao",
+            "Gagan Deep Singh",
+            "Deep Patel",
+        ])],
+    }
+
+    result = save_case(client, case_payload)
+
+    assert result["overall_status"] == OverallStatus.APPROVED.value
+
+
+def test_duplicate_approvals_do_not_count_twice():
+    client = FakeClient()
+    case_payload = {
+        "covering_number": "404",
+        "description": "contractor payment",
+        "urgency": "NORMAL",
+        "participants": [
+            {"person": "Mukesh", "status": ParticipantStatus.APPROVED.value, "last_message": "Approved"},
+            {"person": "Mukesh", "status": ParticipantStatus.APPROVED.value, "last_message": "Approved again"},
+            {"person": "Mehta Ji SPM Dv Bsp Site", "status": ParticipantStatus.APPROVED.value, "last_message": "Approved"},
+            {"person": "Jagga Rao", "status": ParticipantStatus.APPROVED.value, "last_message": "Approved"},
+            {"person": "Gagan Deep Singh", "status": ParticipantStatus.APPROVED.value, "last_message": "Approved"},
+            {"person": "Deep Patel", "status": ParticipantStatus.APPROVED.value, "last_message": "Approved"},
+        ],
+        "messages": [{"timestamp": f"2024-01-02T09:{i:02d}:00", "sender": person, "text": "Approved"} for i, person in enumerate([
+            "Mukesh",
+            "Mukesh",
+            "Mehta Ji SPM Dv Bsp Site",
+            "Jagga Rao",
+            "Gagan Deep Singh",
+            "Deep Patel",
+        ])],
+    }
+
+    result = save_case(client, case_payload)
+
+    assert result["overall_status"] == OverallStatus.APPROVED.value
 
 
 def test_invalid_status_values_are_rejected():

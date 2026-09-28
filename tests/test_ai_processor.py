@@ -1,3 +1,6 @@
+import json
+from types import SimpleNamespace
+
 import pytest
 from pydantic import ValidationError
 
@@ -10,9 +13,14 @@ from ai_processor import (
 )
 
 
-class FakeGeminiResponse:
+class FakeGroqResponse:
     def __init__(self, payload):
-        self.parsed = payload
+        self.choices = [
+            SimpleNamespace(
+                message=SimpleNamespace(content=json.dumps(payload)),
+                finish_reason="stop",
+            )
+        ]
 
 
 def test_everyone_approved():
@@ -29,7 +37,7 @@ def test_everyone_approved():
         "last_seen": "2024-01-02T09:03:00",
     }
 
-    response = FakeGeminiResponse(
+    response = FakeGroqResponse(
         {
             "covering_number": "259",
             "description": "contractor payment",
@@ -66,7 +74,7 @@ def test_some_people_pending():
         "last_seen": "2024-01-03T08:10:00",
     }
 
-    response = FakeGeminiResponse(
+    response = FakeGroqResponse(
         {
             "covering_number": "265",
             "description": "contractor payment",
@@ -97,7 +105,7 @@ def test_rejected_request():
         "last_seen": "2024-01-04T10:05:00",
     }
 
-    response = FakeGeminiResponse(
+    response = FakeGroqResponse(
         {
             "covering_number": "300",
             "description": "contractor payment",
@@ -127,7 +135,7 @@ def test_ambiguous_response_uses_unknown():
         "last_seen": "2024-01-05T12:01:00",
     }
 
-    response = FakeGeminiResponse(
+    response = FakeGroqResponse(
         {
             "covering_number": "777",
             "description": "contractor payment",
@@ -157,7 +165,7 @@ def test_missing_description_is_null():
         "last_seen": "2024-01-06T09:03:00",
     }
 
-    response = FakeGeminiResponse(
+    response = FakeGroqResponse(
         {
             "covering_number": "888",
             "description": None,
@@ -173,6 +181,48 @@ def test_missing_description_is_null():
 
     assert result.description is None
     assert result.urgency == UrgencyLevel.UNKNOWN
+
+
+@pytest.mark.parametrize(
+    ("covering_number", "message_text", "expected_person"),
+    [
+        ("7777", "Covering 7777 approved by deep sir", "Deep Patel"),
+        ("8888", "Mehta sir approved 8888", "Mehta Ji SPM Dv Bsp Site"),
+        ("8888", "Gagan sir approved 8888", "Gagan Deep Singh"),
+    ],
+)
+def test_explicit_named_approver_overrides_sender_attribution(covering_number, message_text, expected_person):
+    case = {
+        "covering_number": covering_number,
+        "messages": [{"timestamp": "2026-09-29T09:00:00", "sender": "Suyash", "text": message_text}],
+    }
+    response = FakeGroqResponse(
+        {
+            "covering_number": covering_number,
+            "description": None,
+            "urgency": "UNKNOWN",
+            "participants": [{"person": "Suyash", "status": "APPROVED", "last_message": message_text}],
+            "overall_status": "APPROVED",
+        }
+    )
+
+    result = interpret_covering_case(case, gemini_client=response)
+
+    assert [(participant.person, participant.status) for participant in result.participants] == [
+        (expected_person, ParticipantStatus.APPROVED)
+    ]
+
+
+def test_json_schema_has_explicit_required_and_additional_properties_false():
+    schema = CaseInterpretation.model_json_schema()
+    participant_schema = schema["$defs"]["ParticipantInterpretation"]
+
+    assert schema.get("additionalProperties") is False
+    assert participant_schema.get("additionalProperties") is False
+
+    assert set(schema["required"]) == set(schema["properties"]) - set()
+    assert set(schema["required"]) == {"covering_number", "description", "urgency", "participants", "overall_status"}
+    assert set(participant_schema["required"]) == {"person", "status", "last_message"}
 
 
 def test_invalid_ai_status_values_are_rejected():

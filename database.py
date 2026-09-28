@@ -1,4 +1,5 @@
 import os
+import re
 from datetime import datetime, timezone
 from typing import Any
 
@@ -6,6 +7,14 @@ from dotenv import load_dotenv
 from supabase import create_client
 
 from ai_processor import CaseInterpretation, OverallStatus, ParticipantStatus
+
+REQUIRED_APPROVALS: tuple[dict[str, Any], ...] = (
+    {"role": "PROJECT MANAGER", "names": {"mukesh"}},
+    {"role": "ADD GENERAL MANAGER", "names": {"mehta", "mehta ji spm dv bsp site", "mehta sir"}},
+    {"role": "GENERAL MANAGER", "names": {"jagga", "jagga rao", "jagga rao sir", "jagga sir"}},
+    {"role": "CLUSTER HEAD", "names": {"gagan", "gagan deep singh", "gagan deep singh sir", "gagan sir"}},
+    {"role": "DIRECTOR", "names": {"deep", "deep patel", "deep patel sir", "deep sir"}},
+)
 
 
 def _utc_now() -> str:
@@ -93,6 +102,45 @@ def _merge_optional_value(existing: Any, incoming: Any) -> Any:
     return incoming
 
 
+def _normalize_person_key(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).strip()
+
+
+def _person_matches_any_alias(person_key: str, aliases: set[str]) -> bool:
+    if not person_key:
+        return False
+    for alias in aliases:
+        normalized_alias = _normalize_person_key(alias)
+        if not normalized_alias:
+            continue
+        if person_key == normalized_alias or person_key.startswith(normalized_alias) or normalized_alias.startswith(person_key):
+            return True
+        if normalized_alias in person_key or person_key in normalized_alias:
+            return True
+    return False
+
+
+def _determine_required_approval_status(participants: list[dict[str, Any]]) -> OverallStatus:
+    approved_roles: set[str] = set()
+
+    for participant in participants:
+        if not isinstance(participant, dict):
+            continue
+
+        person = str(participant.get("person") or "").strip()
+        status = str(participant.get("status") or "").upper()
+        if not person or status not in {ParticipantStatus.APPROVED.value, ParticipantStatus.OK.value}:
+            continue
+
+        normalized_person = _normalize_person_key(person)
+        for requirement in REQUIRED_APPROVALS:
+            if _person_matches_any_alias(normalized_person, requirement["names"]):
+                approved_roles.add(requirement["role"])
+                break
+
+    return OverallStatus.APPROVED if len(approved_roles) >= len(REQUIRED_APPROVALS) else OverallStatus.PENDING
+
+
 def _resolve_case_payload(case_data: dict[str, Any], interpretation: Any | None = None) -> dict[str, Any]:
     if interpretation is not None:
         parsed = _coerce_case_interpretation(interpretation)
@@ -109,9 +157,15 @@ def _resolve_case_payload(case_data: dict[str, Any], interpretation: Any | None 
 
     description = base.get("description")
     urgency = base.get("urgency")
-    overall_status = str(base.get("overall_status", OverallStatus.UNKNOWN.value)).upper()
-    if overall_status not in {item.value for item in OverallStatus}:
-        raise ValueError(f"Invalid overall status: {overall_status}")
+    explicit_overall_status = base.get("overall_status")
+    if explicit_overall_status is not None:
+        normalized_overall_status = (
+            explicit_overall_status.value
+            if isinstance(explicit_overall_status, OverallStatus)
+            else str(explicit_overall_status).upper()
+        )
+        if normalized_overall_status not in {item.value for item in OverallStatus}:
+            raise ValueError(f"Invalid overall status: {normalized_overall_status}")
 
     participants = []
     for item in base.get("participants", []):
@@ -125,6 +179,8 @@ def _resolve_case_payload(case_data: dict[str, Any], interpretation: Any | None 
         for item in case_data.get("participants", []):
             if isinstance(item, str):
                 participants.append({"person": item, "status": ParticipantStatus.UNKNOWN.value, "last_message": None})
+
+    overall_status = _determine_required_approval_status(participants).value
 
     case_payload = {
         "covering_number": covering_number,
@@ -176,7 +232,7 @@ def upsert_case(client: Any, case_data: dict[str, Any], interpretation: Any | No
         "description": _merge_optional_value(existing.get("description"), incoming_case.get("description")),
         "urgency": _merge_optional_value(existing.get("urgency"), incoming_case.get("urgency")),
         "raised_by": _merge_optional_value(existing.get("raised_by"), incoming_case.get("raised_by")),
-        "overall_status": _merge_optional_value(existing.get("overall_status"), incoming_case.get("overall_status")),
+        "overall_status": incoming_case["overall_status"],
         "first_seen": incoming_case.get("first_seen") or existing.get("first_seen"),
         "last_seen": incoming_case.get("last_seen") or existing.get("last_seen"),
         "created_at": existing.get("created_at"),
@@ -268,6 +324,7 @@ def get_messages(client: Any | None = None, case_id: str | None = None) -> list[
 def save_case(client: Any, case_data: dict[str, Any], interpretation: Any | None = None) -> dict[str, Any]:
     resolved = _resolve_case_payload(case_data, interpretation)
     case_payload = resolved["case"]
+    case_payload["participants"] = resolved["participants"]
     case_record = upsert_case(client, case_payload, interpretation)
 
     for participant in resolved["participants"]:
