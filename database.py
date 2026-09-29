@@ -8,6 +8,9 @@ from supabase import create_client
 
 from ai_processor import CaseInterpretation, OverallStatus, ParticipantStatus
 
+_supabase_client: Any | None = None
+_supabase_client_config: tuple[str, str] | None = None
+
 REQUIRED_APPROVALS: tuple[dict[str, Any], ...] = (
     {"role": "PROJECT MANAGER", "names": {"mukesh"}},
     {"role": "ADD GENERAL MANAGER", "names": {"mehta", "mehta ji spm dv bsp site", "mehta sir"}},
@@ -50,8 +53,14 @@ def load_environment() -> dict[str, str]:
 
 
 def get_supabase_client():
+    global _supabase_client, _supabase_client_config
+
     env = load_environment()
-    return create_client(env["SUPABASE_URL"], env["SUPABASE_SECRET_KEY"])
+    config = (env["SUPABASE_URL"], env["SUPABASE_SECRET_KEY"])
+    if _supabase_client is None or _supabase_client_config != config:
+        _supabase_client = create_client(*config)
+        _supabase_client_config = config
+    return _supabase_client
 
 
 def _coerce_case_interpretation(value: Any) -> CaseInterpretation:

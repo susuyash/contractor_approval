@@ -142,6 +142,7 @@ def test_sync_all_to_google_sheets_writes_summary_and_history(monkeypatch):
     spreadsheet_id = "spreadsheet-123"
 
     cases = [{
+        "id": "case-259",
         "covering_number": "259",
         "description": "Payment request",
         "first_seen": "2026-08-01T09:00:00Z",
@@ -149,15 +150,19 @@ def test_sync_all_to_google_sheets_writes_summary_and_history(monkeypatch):
     }]
     participants = [{"person": "Mukesh", "status": "APPROVED"}]
     messages = [{"timestamp": "2026-08-01T09:00:00Z", "sender": "Utpal Singh", "text": "Case 259 generated"}]
+    database_client = object()
+    used_clients = []
 
     monkeypatch.setenv("GOOGLE_SHEETS_SPREADSHEET_ID", spreadsheet_id)
-    monkeypatch.setattr("google_sheets.get_cases", lambda: cases)
-    monkeypatch.setattr("google_sheets.get_participants", lambda case_id: participants)
-    monkeypatch.setattr("google_sheets.get_messages", lambda case_id: messages)
+    monkeypatch.setattr("google_sheets.get_supabase_client", lambda: database_client)
+    monkeypatch.setattr("google_sheets.get_cases", lambda client: used_clients.append(client) or cases)
+    monkeypatch.setattr("google_sheets.get_participants", lambda client, case_id: used_clients.append(client) or participants)
+    monkeypatch.setattr("google_sheets.get_messages", lambda client, case_id: used_clients.append(client) or messages)
     monkeypatch.setattr("google_sheets.get_sheets_service", lambda: service)
 
     sync_all_to_google_sheets()
 
+    assert used_clients == [database_client, database_client, database_client, database_client]
     assert service.spreadsheets().batchUpdate.call_count >= 2
     assert service.spreadsheets().values().update.call_count >= 2
 

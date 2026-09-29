@@ -2,7 +2,18 @@ import pytest
 from pydantic import ValidationError
 
 from ai_processor import CaseInterpretation, OverallStatus, ParticipantInterpretation, ParticipantStatus
-from database import save_case, upsert_case, upsert_participant, insert_message, get_or_create_case, load_environment
+from database import (
+    get_cases,
+    get_messages,
+    get_participants,
+    get_supabase_client,
+    insert_message,
+    load_environment,
+    save_case,
+    upsert_case,
+    upsert_participant,
+    get_or_create_case,
+)
 
 
 class FakeQueryResult:
@@ -52,6 +63,9 @@ class FakeTable:
 
     def eq(self, field, value):
         self._filters.append((field, value))
+        return self
+
+    def order(self, *_args, **_kwargs):
         return self
 
     def execute(self):
@@ -328,3 +342,28 @@ def test_environment_variables_are_required_and_not_printed(monkeypatch):
     monkeypatch.setenv("SUPABASE_SECRET_KEY", "")
     with pytest.raises(ValueError):
         load_environment()
+
+
+def test_get_supabase_client_reuses_client(monkeypatch):
+    client = object()
+    created = []
+    monkeypatch.setenv("SUPABASE_URL", "https://example.supabase.co")
+    monkeypatch.setenv("SUPABASE_SECRET_KEY", "secret")
+    monkeypatch.setattr("database._supabase_client", None)
+    monkeypatch.setattr("database._supabase_client_config", None)
+    monkeypatch.setattr("database.create_client", lambda url, key: created.append((url, key)) or client)
+
+    assert get_supabase_client() is client
+    assert get_supabase_client() is client
+    assert created == [("https://example.supabase.co", "secret")]
+
+
+def test_database_reads_keep_existing_results_with_explicit_client(monkeypatch):
+    client = FakeClient()
+    client.participants.records = [{"case_id": "case-1", "person": "Jay", "status": "APPROVED"}]
+    client.messages.records = [{"case_id": "case-1", "sender": "Jay", "message": "Approved"}]
+    monkeypatch.setattr("database.get_supabase_client", lambda: pytest.fail("unexpected client creation"))
+
+    assert get_cases(client=client, status="approved") == client.cases.records
+    assert get_participants(client=client, case_id="case-1") == client.participants.records
+    assert get_messages(client=client, case_id="case-1") == client.messages.records

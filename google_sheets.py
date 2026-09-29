@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
-from database import get_cases, get_messages, get_participants
+from database import get_cases, get_messages, get_participants, get_supabase_client
 
 load_dotenv()
 
@@ -182,13 +182,13 @@ def _format_datetime(value: str | None) -> str:
         return str(value)
 
 
-def _get_case_messages(case: dict[str, Any], messages: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+def _get_case_messages(case: dict[str, Any], messages: list[dict[str, Any]] | None = None, client: Any | None = None) -> list[dict[str, Any]]:
     if messages is not None:
         return messages
     case_id = case.get("id")
     if not case_id:
         return []
-    return get_messages(case_id=case_id)
+    return get_messages(client=client, case_id=case_id)
 
 
 def _find_fifth_approval_timestamp(messages: list[dict[str, Any]]) -> tuple[str | None, str | None]:
@@ -468,10 +468,10 @@ def _delete_legacy_sheets(service: Any, spreadsheet_id: str) -> None:
             ).execute()
 
 
-def _write_case_history_sheet(service: Any, spreadsheet_id: str, cases: list[dict[str, Any]]) -> None:
+def _write_case_history_sheet(service: Any, spreadsheet_id: str, cases: list[dict[str, Any]], client: Any | None = None) -> None:
     rows: list[list[Any]] = []
     for case in cases:
-        case_messages = _get_case_messages(case)
+        case_messages = _get_case_messages(case, client=client)
         rows.extend(build_case_history_rows(case, case_messages))
         rows.append([])
     if rows:
@@ -503,7 +503,8 @@ def sync_all_to_google_sheets(service: Any | None = None, spreadsheet_id: str | 
     if service is None:
         service = get_sheets_service()
 
-    cases = get_cases()
+    client = get_supabase_client()
+    cases = get_cases(client=client)
     participants_rows: list[dict[str, Any]] = []
     messages_rows: list[dict[str, Any]] = []
 
@@ -511,13 +512,13 @@ def sync_all_to_google_sheets(service: Any | None = None, spreadsheet_id: str | 
         case_id = case.get("id")
         covering_number = str(case.get("covering_number") or "")
 
-        participants = get_participants(case_id=case_id)
+        participants = get_participants(client=client, case_id=case_id)
         for participant in participants:
             enriched = dict(participant)
             enriched["covering_number"] = covering_number
             participants_rows.append(enriched)
 
-        messages = get_messages(case_id=case_id)
+        messages = get_messages(client=client, case_id=case_id)
         for message in messages:
             enriched = dict(message)
             enriched["covering_number"] = covering_number
@@ -525,7 +526,7 @@ def sync_all_to_google_sheets(service: Any | None = None, spreadsheet_id: str | 
 
     _delete_legacy_sheets(service, spreadsheet_id)
     sync_cases_to_sheet(service, spreadsheet_id, cases, participants_rows, messages_rows)
-    _write_case_history_sheet(service, spreadsheet_id, cases)
+    _write_case_history_sheet(service, spreadsheet_id, cases, client=client)
 
     response = service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
     titles = [sheet["properties"]["title"] for sheet in response.get("sheets", []) if "properties" in sheet and "title" in sheet["properties"]]
