@@ -1,3 +1,4 @@
+import hashlib
 import json
 import logging
 import os
@@ -9,16 +10,16 @@ from flask import Flask, request
 
 from ai_processor import interpret_cases
 from covering_cases import extract_covering_cases
-from database import get_supabase_client, save_case
-from google_sheets import sync_all_to_google_sheets
+from database import enqueue_webhook_message, get_supabase_client, save_case
+from webhook_worker import start_worker, wake_worker
 
 load_dotenv()
 
 app = Flask(__name__)
 @app.get("/healthz")
 def healthz():
+    start_worker()
     return {"status": "ok"}, 200
-SEEN_MESSAGE_IDS: set[str] = set()
 logger = logging.getLogger(__name__)
 
 
@@ -86,7 +87,9 @@ def adapt_whapi_message_to_case_pipeline(normalized: dict[str, Any]) -> dict[str
     timestamp_value = normalized.get("timestamp")
     try:
         if isinstance(timestamp_value, (int, float)):
-            timestamp = datetime.fromtimestamp(timestamp_value, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+            timestamp = datetime.fromtimestamp(timestamp_value, tz=timezone.utc).isoformat(timespec="seconds")
+        elif isinstance(timestamp_value, str) and timestamp_value.isdigit():
+            timestamp = datetime.fromtimestamp(int(timestamp_value), tz=timezone.utc).isoformat(timespec="seconds")
         else:
             timestamp = str(timestamp_value or "")
     except (TypeError, ValueError):
@@ -99,24 +102,17 @@ def adapt_whapi_message_to_case_pipeline(normalized: dict[str, Any]) -> dict[str
     }
 
 
-def _is_duplicate_message(message_id: str | None) -> bool:
-    if not message_id:
-        return False
-    if message_id in SEEN_MESSAGE_IDS:
-        return True
-    SEEN_MESSAGE_IDS.add(message_id)
-    return False
-
-
 def _build_case_payload(case: dict[str, Any], interpretation: Any) -> dict[str, Any]:
+    messages = case.get("messages", [])
     return {
         "covering_number": case.get("covering_number"),
         "description": getattr(interpretation, "description", None),
         "urgency": getattr(getattr(interpretation, "urgency", None), "value", None),
+        "raised_by": (messages[0].get("sender") if messages else None),
         "first_seen": case.get("first_seen"),
         "last_seen": case.get("last_seen"),
         "participants": [participant.model_dump() for participant in getattr(interpretation, "participants", [])],
-        "messages": case.get("messages", []),
+        "messages": messages,
     }
 
 
@@ -135,12 +131,16 @@ def process_whapi_case(normalized: dict[str, Any]) -> list[Any]:
     for case, interpretation in zip(cases, interpretations):
         payload = _build_case_payload(case, interpretation)
         save_case(client, payload, interpretation)
-        try:
-            sync_all_to_google_sheets()
-        except Exception:
-            logger.exception("Google Sheets sync failed after saving covering %s", case.get("covering_number"))
 
     return interpretations
+
+
+def _event_key(normalized: dict[str, Any]) -> str:
+    message_id = str(normalized.get("message_id") or "").strip()
+    identity = message_id or hashlib.sha256(
+        json.dumps(normalized, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+    return f"{normalized.get('chat_id', '')}:{identity}"
 
 
 def ingest_whapi_message(payload: Any) -> list[dict[str, Any]]:
@@ -164,12 +164,15 @@ def ingest_whapi_message(payload: Any) -> list[dict[str, Any]]:
         if normalized is None:
             continue
 
-        if _is_duplicate_message(normalized.get("message_id")):
+        pipeline_message = adapt_whapi_message_to_case_pipeline(normalized)
+        if pipeline_message is None or not extract_covering_cases([pipeline_message]):
             continue
 
-        process_whapi_case(normalized)
+        client = get_supabase_client()
+        enqueue_webhook_message(client, _event_key(normalized), normalized)
+        start_worker()
+        wake_worker()
         accepted.append(normalized)
-        print(json.dumps(normalized, ensure_ascii=False))
 
     return accepted
 
@@ -181,7 +184,11 @@ def whapi_webhook() -> tuple[str, int]:
     except Exception:
         payload = None
 
-    ingest_whapi_message(payload)
+    try:
+        ingest_whapi_message(payload)
+    except Exception:
+        logger.error("Could not durably enqueue Whapi webhook payload")
+        return "", 503
     return "", 200
 
 

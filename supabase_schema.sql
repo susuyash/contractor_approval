@@ -31,11 +31,24 @@ CREATE TABLE IF NOT EXISTS messages (
     UNIQUE (case_id, sender, message, timestamp)
 );
 
+CREATE TABLE IF NOT EXISTS whapi_inbox (
+    event_key TEXT PRIMARY KEY,
+    payload JSONB NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'processing', 'sheets_pending', 'complete')),
+    attempts INTEGER NOT NULL DEFAULT 0,
+    locked_at TIMESTAMPTZ,
+    next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_error TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 CREATE INDEX IF NOT EXISTS idx_cases_covering_number ON cases(covering_number);
 CREATE INDEX IF NOT EXISTS idx_cases_overall_status ON cases(overall_status);
 CREATE INDEX IF NOT EXISTS idx_participants_case_id ON participants(case_id);
 CREATE INDEX IF NOT EXISTS idx_messages_case_id ON messages(case_id);
 CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp);
+CREATE INDEX IF NOT EXISTS idx_whapi_inbox_status_retry ON whapi_inbox(status, next_attempt_at, created_at);
 
 CREATE OR REPLACE FUNCTION update_updated_at_column()
 RETURNS TRIGGER AS $$
@@ -56,6 +69,12 @@ CREATE TRIGGER participants_updated_at_trigger
 BEFORE UPDATE ON participants
 FOR EACH ROW
 EXECUTE FUNCTION update_updated_at_column();
+DROP TRIGGER IF EXISTS whapi_inbox_updated_at_trigger ON whapi_inbox;
+CREATE TRIGGER whapi_inbox_updated_at_trigger
+BEFORE UPDATE ON whapi_inbox
+FOR EACH ROW
+EXECUTE FUNCTION update_updated_at_column();
 ALTER TABLE cases ENABLE ROW LEVEL SECURITY;
 ALTER TABLE participants ENABLE ROW LEVEL SECURITY;
 ALTER TABLE messages ENABLE ROW LEVEL SECURITY;
+ALTER TABLE whapi_inbox ENABLE ROW LEVEL SECURITY;

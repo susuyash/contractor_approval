@@ -1,5 +1,6 @@
 import json
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 from pydantic import ValidationError
@@ -10,6 +11,7 @@ from ai_processor import (
     ParticipantStatus,
     UrgencyLevel,
     interpret_covering_case,
+    call_gemini,
 )
 
 
@@ -187,6 +189,7 @@ def test_missing_description_is_null():
     ("covering_number", "message_text", "expected_person"),
     [
         ("7777", "Covering 7777 approved by deep sir", "Deep Patel"),
+        ("7778", "Covering 7778 approved by Mehta sir", "Mehta Ji SPM Dv Bsp Site"),
         ("8888", "Mehta sir approved 8888", "Mehta Ji SPM Dv Bsp Site"),
         ("8888", "Gagan sir approved 8888", "Gagan Deep Singh"),
     ],
@@ -236,6 +239,25 @@ def test_invalid_ai_status_values_are_rejected():
                 "overall_status": "APPROVED",
             }
         )
+
+
+def test_groq_client_uses_bounded_timeout_without_automatic_retries(monkeypatch):
+    monkeypatch.setenv("GROQ_API_KEY", "test-key")
+    client = MagicMock()
+    client.chat.completions.create.return_value = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content='{"ok": true}'))]
+    )
+    options = {}
+
+    def make_client(**kwargs):
+        options.update(kwargs)
+        return client
+
+    monkeypatch.setattr("ai_processor.OpenAI", make_client)
+
+    assert call_gemini({"covering_number": "1234", "messages": []}) == {"ok": True}
+    assert options["timeout"] == 15.0
+    assert options["max_retries"] == 0
 
     with pytest.raises(ValidationError):
         CaseInterpretation.model_validate(

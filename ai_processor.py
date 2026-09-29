@@ -233,6 +233,8 @@ def call_gemini(case: dict[str, Any], client: Any | None = None, model_name: str
         client = OpenAI(
             api_key=api_key,
             base_url="https://api.groq.com/openai/v1",
+            timeout=15.0,
+            max_retries=0,
         )
 
     model = model_name or get_gemini_model_name()

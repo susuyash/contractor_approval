@@ -4,9 +4,11 @@ from pydantic import ValidationError
 from ai_processor import CaseInterpretation, OverallStatus, ParticipantInterpretation, ParticipantStatus
 from database import (
     get_cases,
+    get_due_sheets_events,
     get_messages,
     get_participants,
     get_supabase_client,
+    enqueue_webhook_message,
     insert_message,
     load_environment,
     save_case,
@@ -49,7 +51,10 @@ class FakeTable:
     def upsert(self, payload, on_conflict=None):
         self.last_upsert = payload
         self._filters = []
-        existing = next((item for item in self.records if item.get("covering_number") == payload.get("covering_number")), None)
+        if "covering_number" in payload:
+            existing = next((item for item in self.records if item.get("covering_number") == payload.get("covering_number")), None)
+        else:
+            existing = next((item for item in self.records if item.get("case_id") == payload.get("case_id") and item.get("person") == payload.get("person")), None)
         if existing:
             existing.update(payload)
             return FakeQueryResult([existing])
@@ -241,6 +246,31 @@ def test_existing_approved_case_is_downgraded_when_only_one_required_approves():
     assert client.cases.last_upsert["overall_status"] == OverallStatus.PENDING.value
 
 
+def test_ambiguous_reprocessing_preserves_all_confirmed_approvals():
+    client = FakeClient()
+    client.participants.records = [
+        {"case_id": "case-1", "person": person, "status": ParticipantStatus.APPROVED.value, "last_message": "Approved"}
+        for person in [
+            "Mukesh",
+            "Mehta Ji SPM Dv Bsp Site",
+            "Jagga Rao",
+            "Gagan Deep Singh",
+            "Deep Patel",
+        ]
+    ]
+
+    result = save_case(
+        client,
+        {
+            "covering_number": "259",
+            "participants": [{"person": "Mukesh", "status": "PENDING", "last_message": "will check"}],
+        },
+    )
+
+    assert result["overall_status"] == OverallStatus.APPROVED.value
+    assert client.cases.last_upsert["overall_status"] == OverallStatus.APPROVED.value
+
+
 def test_four_approvals_keeps_case_pending():
     client = FakeClient()
     case_payload = {
@@ -367,3 +397,41 @@ def test_database_reads_keep_existing_results_with_explicit_client(monkeypatch):
     assert get_cases(client=client, status="approved") == client.cases.records
     assert get_participants(client=client, case_id="case-1") == client.participants.records
     assert get_messages(client=client, case_id="case-1") == client.messages.records
+
+
+def test_bulk_participant_and_message_reads_preserve_default_empty_behavior():
+    client = FakeClient()
+    client.participants.records = [{"case_id": "case-1", "person": "Jay"}]
+    client.messages.records = [{"case_id": "case-1", "sender": "Jay", "message": "Approved"}]
+
+    assert get_participants(client=client) == []
+    assert get_messages(client=client) == []
+    assert get_participants(client=client, all_cases=True) == client.participants.records
+    assert get_messages(client=client, all_cases=True) == client.messages.records
+
+
+def test_webhook_inbox_enqueue_uses_durable_conflict_key():
+    class InboxTable:
+        def __init__(self):
+            self.kwargs = None
+
+        def upsert(self, payload, **kwargs):
+            self.kwargs = (payload, kwargs)
+            return self
+
+        def execute(self):
+            return FakeQueryResult([])
+
+    class InboxClient:
+        def __init__(self):
+            self.inbox = InboxTable()
+
+        def table(self, name):
+            assert name == "whapi_inbox"
+            return self.inbox
+
+    client = InboxClient()
+    assert enqueue_webhook_message(client, "group:message-1", {"message": "Covering 1234"}) is False
+    payload, options = client.inbox.kwargs
+    assert payload["event_key"] == "group:message-1"
+    assert options == {"on_conflict": "event_key", "ignore_duplicates": True}

@@ -1,6 +1,6 @@
 import os
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from dotenv import load_dotenv
@@ -148,6 +148,43 @@ def _determine_required_approval_status(participants: list[dict[str, Any]]) -> O
                 break
 
     return OverallStatus.APPROVED if len(approved_roles) >= len(REQUIRED_APPROVALS) else OverallStatus.PENDING
+
+
+def _required_role_for_person(person: Any) -> str | None:
+    normalized_person = _normalize_person_key(person)
+    for requirement in REQUIRED_APPROVALS:
+        if _person_matches_any_alias(normalized_person, requirement["names"]):
+            return requirement["role"]
+    return None
+
+
+def _participant_key(participant: dict[str, Any]) -> str:
+    role = _required_role_for_person(participant.get("person"))
+    return f"role:{role}" if role else f"person:{_normalize_person_key(participant.get('person'))}"
+
+
+def _merge_existing_approvals(
+    existing: list[dict[str, Any]], incoming: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    merged: dict[str, dict[str, Any]] = {}
+    for participant in incoming:
+        key = _participant_key(participant)
+        current = merged.get(key)
+        if current is None or str(participant.get("status") or "").upper() in {"APPROVED", "OK"}:
+            merged[key] = dict(participant)
+
+    for participant in existing:
+        if str(participant.get("status") or "").upper() not in {"APPROVED", "OK"}:
+            continue
+        key = _participant_key(participant)
+        current = merged.get(key)
+        if current is None:
+            merged[key] = dict(participant)
+        elif str(current.get("status") or "").upper() not in {"APPROVED", "OK"}:
+            current["status"] = ParticipantStatus.APPROVED.value
+            current["last_message"] = participant.get("last_message") or current.get("last_message")
+
+    return list(merged.values())
 
 
 def _resolve_case_payload(case_data: dict[str, Any], interpretation: Any | None = None) -> dict[str, Any]:
@@ -314,24 +351,42 @@ def get_case_by_covering_number(client: Any | None = None, covering_number: str 
     return data[0] if data else None
 
 
-def get_participants(client: Any | None = None, case_id: str | None = None) -> list[dict[str, Any]]:
-    if not case_id:
+def get_participants(client: Any | None = None, case_id: str | None = None, *, all_cases: bool = False) -> list[dict[str, Any]]:
+    if not case_id and not all_cases:
         return []
     db_client = client or get_supabase_client()
-    rows = db_client.table("participants").select("*").eq("case_id", case_id).order("person").execute()
+    query = db_client.table("participants").select("*")
+    if case_id:
+        query = query.eq("case_id", case_id)
+    rows = query.order("person").execute()
     return _unwrap_rows(rows)
 
 
-def get_messages(client: Any | None = None, case_id: str | None = None) -> list[dict[str, Any]]:
-    if not case_id:
+def get_messages(client: Any | None = None, case_id: str | None = None, *, all_cases: bool = False) -> list[dict[str, Any]]:
+    if not case_id and not all_cases:
         return []
     db_client = client or get_supabase_client()
-    rows = db_client.table("messages").select("*").eq("case_id", case_id).order("timestamp").execute()
+    query = db_client.table("messages").select("*")
+    if case_id:
+        query = query.eq("case_id", case_id)
+    rows = query.order("timestamp").execute()
     return _unwrap_rows(rows)
 
 
 def save_case(client: Any, case_data: dict[str, Any], interpretation: Any | None = None) -> dict[str, Any]:
     resolved = _resolve_case_payload(case_data, interpretation)
+    existing_case = get_case_by_covering_number(
+        client=client,
+        covering_number=resolved["case"]["covering_number"],
+    )
+    if existing_case:
+        existing_participants = get_participants(client=client, case_id=existing_case.get("id"))
+        resolved["participants"] = _merge_existing_approvals(existing_participants, resolved["participants"])
+        resolved["case"]["overall_status"] = _determine_required_approval_status(
+            resolved["participants"]
+        ).value
+        resolved["case"]["raised_by"] = resolved["case"].get("raised_by") or existing_case.get("raised_by")
+
     case_payload = resolved["case"]
     case_payload["participants"] = resolved["participants"]
     case_record = upsert_case(client, case_payload, interpretation)
@@ -343,3 +398,87 @@ def save_case(client: Any, case_data: dict[str, Any], interpretation: Any | None
         insert_message(client, case_record["id"], message)
 
     return case_record
+
+
+def enqueue_webhook_message(client: Any, event_key: str, payload: dict[str, Any]) -> bool:
+    result = client.table("whapi_inbox").upsert(
+        {"event_key": event_key, "payload": payload},
+        on_conflict="event_key",
+        ignore_duplicates=True,
+    ).execute()
+    return bool(_unwrap_rows(result))
+
+
+def reset_stale_webhook_events(client: Any, lease_minutes: int = 5) -> None:
+    stale_before = (datetime.now(timezone.utc) - timedelta(minutes=lease_minutes)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    client.table("whapi_inbox").update(
+        {"status": "pending", "locked_at": None, "next_attempt_at": _utc_now()}
+    ).eq("status", "processing").lt("locked_at", stale_before).execute()
+
+
+def claim_next_webhook_event(client: Any) -> dict[str, Any] | None:
+    rows = client.table("whapi_inbox").select("*").eq("status", "pending").lte(
+        "next_attempt_at", _utc_now()
+    ).order("created_at").limit(1).execute()
+    events = _unwrap_rows(rows)
+    if not events:
+        return None
+
+    event = events[0]
+    claimed = client.table("whapi_inbox").update(
+        {
+            "status": "processing",
+            "locked_at": _utc_now(),
+            "attempts": int(event.get("attempts") or 0) + 1,
+        }
+    ).eq("event_key", event["event_key"]).eq("status", "pending").select("*").execute()
+    claimed_rows = _unwrap_rows(claimed)
+    return claimed_rows[0] if claimed_rows else None
+
+
+def get_due_sheets_events(client: Any, limit: int = 100) -> list[dict[str, Any]]:
+    rows = client.table("whapi_inbox").select("event_key,attempts").eq(
+        "status", "sheets_pending"
+    ).lte("next_attempt_at", _utc_now()).order("created_at").limit(limit).execute()
+    return _unwrap_rows(rows)
+
+
+def update_webhook_events(
+    client: Any,
+    event_keys: list[str],
+    status: str,
+    *,
+    next_attempt_at: str | None = None,
+    last_error: str | None = None,
+) -> None:
+    if not event_keys:
+        return
+    values: dict[str, Any] = {"status": status, "locked_at": None, "last_error": last_error}
+    if next_attempt_at is not None:
+        values["next_attempt_at"] = next_attempt_at
+    client.table("whapi_inbox").update(values).in_("event_key", event_keys).execute()
+
+
+def retry_webhook_event(client: Any, event: dict[str, Any], error: Exception) -> None:
+    attempts = int(event.get("attempts") or 1)
+    delay_seconds = min(2 ** min(attempts, 8), 300)
+    retry_at = (datetime.now(timezone.utc) + timedelta(seconds=delay_seconds)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    client.table("whapi_inbox").update(
+        {
+            "status": "pending",
+            "locked_at": None,
+            "next_attempt_at": retry_at,
+            "last_error": type(error).__name__,
+        }
+    ).eq("event_key", event["event_key"]).execute()
+
+
+def retry_sheets_events(client: Any, events: list[dict[str, Any]], error: Exception) -> None:
+    now = datetime.now(timezone.utc)
+    for event in events:
+        attempts = int(event.get("attempts") or 0) + 1
+        delay_seconds = min(2 ** min(attempts, 8), 300)
+        retry_at = (now + timedelta(seconds=delay_seconds)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        client.table("whapi_inbox").update(
+            {"attempts": attempts, "next_attempt_at": retry_at, "last_error": type(error).__name__}
+        ).eq("event_key", event["event_key"]).eq("status", "sheets_pending").execute()

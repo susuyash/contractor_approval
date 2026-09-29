@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import os
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 from google.oauth2 import service_account
@@ -18,6 +19,7 @@ PARTICIPANTS_SHEET_NAME = "Participants"
 MESSAGES_SHEET_NAME = "Messages"
 CASE_HISTORY_SHEET_NAME = "Case History"
 LEGACY_SHEET_NAMES = ["Sheet1", "Participants", "Messages"]
+_legacy_cleanup_checked = False
 
 REQUIRED_APPROVAL_ROLES = [
     "PROJECT MANAGER",
@@ -38,7 +40,7 @@ ROLE_CONTACT_MAPPINGS: dict[str, dict[str, Any]] = {
     },
     "GENERAL MANAGER": {
         "contacts": ["Jagga Rao Sir", "Jagga Sir"],
-        "display_name": "Jagga Sir",
+        "display_name": "Jagga Rao Sir",
     },
     "CLUSTER HEAD": {
         "contacts": ["Gagan Deep Singh", "Gagan Sir"],
@@ -46,7 +48,7 @@ ROLE_CONTACT_MAPPINGS: dict[str, dict[str, Any]] = {
     },
     "DIRECTOR": {
         "contacts": ["Deep Patel Sir", "Deep Sir"],
-        "display_name": "Deep Sir",
+        "display_name": "Deep Patel Sir",
     },
 }
 
@@ -155,31 +157,37 @@ def _get_case_first_seen(case: dict[str, Any]) -> str:
     return str(value)
 
 
-def _format_date(value: str | None) -> str:
+def _as_ist(value: str | None) -> datetime | None:
     if not value:
-        return ""
+        return None
     try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00")).strftime("%d-%m-%y")
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     except ValueError:
-        return str(value).split("T", 1)[0] if "T" in str(value) else str(value)
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(ZoneInfo("Asia/Kolkata"))
+
+
+def _format_date(value: str | None) -> str:
+    formatted = _as_ist(value)
+    if formatted:
+        return formatted.strftime("%d-%m-%y")
+    return str(value).split("T", 1)[0] if value and "T" in str(value) else str(value or "")
 
 
 def _format_time(value: str | None) -> str:
-    if not value:
-        return ""
-    try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00")).strftime("%H:%M")
-    except ValueError:
-        return str(value).split("T", 1)[1][:5] if "T" in str(value) else str(value)
+    formatted = _as_ist(value)
+    if formatted:
+        return formatted.strftime("%H:%M")
+    return str(value).split("T", 1)[1][:5] if value and "T" in str(value) else str(value or "")
 
 
 def _format_datetime(value: str | None) -> str:
-    if not value:
-        return ""
-    try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00")).strftime("%d-%m-%y %H:%M")
-    except ValueError:
-        return str(value)
+    formatted = _as_ist(value)
+    if formatted:
+        return formatted.strftime("%d-%m-%y %H:%M")
+    return str(value or "")
 
 
 def _get_case_messages(case: dict[str, Any], messages: list[dict[str, Any]] | None = None, client: Any | None = None) -> list[dict[str, Any]]:
@@ -198,12 +206,25 @@ def _find_fifth_approval_timestamp(messages: list[dict[str, Any]]) -> tuple[str 
         text = message.get("text") or message.get("message") or ""
         if not sender or not _is_approval_message(text):
             continue
-        role = _match_person_to_role(sender)
+        role = _match_person_to_role(sender) or _match_named_approval_role(text)
         if role and role not in approved_roles:
             approved_roles.add(role)
             if len(approved_roles) == 5:
                 return str(message.get("timestamp") or ""), role
     return None, None
+
+
+def _match_named_approval_role(text: Any) -> str | None:
+    candidate = str(text or "")
+    for role, mapping in ROLE_CONTACT_MAPPINGS.items():
+        names = [*mapping["contacts"], mapping["display_name"]]
+        for name in sorted(names, key=len, reverse=True):
+            alias_pattern = r"\s+".join(re.escape(part) for part in name.split())
+            if re.search(rf"\bapproved\s+by\s+{alias_pattern}\b", candidate, re.IGNORECASE):
+                return role
+            if re.search(rf"\b{alias_pattern}\s+(?:has\s+)?approved\b", candidate, re.IGNORECASE):
+                return role
+    return None
 
 
 def _get_case_approval_status(case: dict[str, Any], participants: list[dict[str, Any]] | None = None) -> tuple[dict[str, Any], int]:
@@ -339,7 +360,10 @@ def build_case_history_rows(case: dict[str, Any], messages: list[dict[str, Any]]
     rows: list[list[Any]] = []
     case_number = str(case.get("covering_number") or "")
     first_seen = str(case.get("first_seen") or "")
-    generated_by = "Utpal Singh"
+    generated_by = case.get("raised_by") or next(
+        (message.get("sender") for message in messages if message.get("sender")),
+        "Unknown",
+    )
 
     rows.append([f"CASE NO: {case_number}"])
     rows.append(["First Generated:"])
@@ -375,31 +399,41 @@ def _get_sheet_id(service: Any, spreadsheet_id: str, sheet_title: str) -> int | 
     return None
 
 
-def _ensure_sheet(service: Any, spreadsheet_id: str, sheet_title: str) -> None:
+def _ensure_sheet(service: Any, spreadsheet_id: str, sheet_title: str) -> bool:
     response = service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
     existing_titles = {
         sheet["properties"]["title"] for sheet in response.get("sheets", []) if "properties" in sheet and "title" in sheet["properties"]
     }
     if sheet_title in existing_titles:
-        return
+        return False
 
     body = {"requests": [{"addSheet": {"properties": {"title": sheet_title}}}]}
     service.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body=body).execute()
+    return True
 
 
-def _write_rows_to_sheet(service: Any, spreadsheet_id: str, sheet_title: str, rows: list[list[Any]]) -> None:
-    _ensure_sheet(service, spreadsheet_id, sheet_title)
-    service.spreadsheets().values().clear(
+def _write_rows_to_sheet(service: Any, spreadsheet_id: str, sheet_title: str, rows: list[list[Any]]) -> bool:
+    created = _ensure_sheet(service, spreadsheet_id, sheet_title)
+    width = max((len(row) for row in rows), default=1)
+    normalized_rows = [row + [""] * (width - len(row)) for row in rows]
+    existing = service.spreadsheets().values().get(
         spreadsheetId=spreadsheet_id,
-        range=sheet_title,
-        body={},
+        range=f"{sheet_title}!A:Z",
     ).execute()
+    old_row_count = len(existing.get("values", []))
     service.spreadsheets().values().update(
         spreadsheetId=spreadsheet_id,
         range=f"{sheet_title}!A1",
         valueInputOption="RAW",
-        body={"values": rows},
+        body={"values": normalized_rows},
     ).execute()
+    if old_row_count > len(rows):
+        service.spreadsheets().values().clear(
+            spreadsheetId=spreadsheet_id,
+            range=f"{sheet_title}!A{len(rows) + 1}:Z{old_row_count}",
+            body={},
+        ).execute()
+    return created
 
 
 def _apply_approval_status_formatting(service: Any, spreadsheet_id: str, sheet_title: str) -> None:
@@ -458,20 +492,25 @@ def _set_case_column_widths(service: Any, spreadsheet_id: str, sheet_title: str)
 
 def _delete_legacy_sheets(service: Any, spreadsheet_id: str) -> None:
     response = service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+    requests = []
     for sheet in response.get("sheets", []):
         props = sheet.get("properties", {})
         title = props.get("title")
         if title in LEGACY_SHEET_NAMES:
-            service.spreadsheets().batchUpdate(
-                spreadsheetId=spreadsheet_id,
-                body={"requests": [{"deleteSheet": {"sheetId": sheet["properties"]["sheetId"]}}]},
-            ).execute()
+            requests.append({"deleteSheet": {"sheetId": props["sheetId"]}})
+    if requests:
+        service.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body={"requests": requests}).execute()
 
 
-def _write_case_history_sheet(service: Any, spreadsheet_id: str, cases: list[dict[str, Any]], client: Any | None = None) -> None:
+def _write_case_history_sheet(
+    service: Any,
+    spreadsheet_id: str,
+    cases: list[dict[str, Any]],
+    messages_by_case: dict[str, list[dict[str, Any]]],
+) -> None:
     rows: list[list[Any]] = []
     for case in cases:
-        case_messages = _get_case_messages(case, client=client)
+        case_messages = messages_by_case.get(str(case.get("id") or ""), [])
         rows.extend(build_case_history_rows(case, case_messages))
         rows.append([])
     if rows:
@@ -481,8 +520,6 @@ def _write_case_history_sheet(service: Any, spreadsheet_id: str, cases: list[dic
 def sync_cases_to_sheet(service: Any, spreadsheet_id: str, cases: list[dict[str, Any]], participants: list[dict[str, Any]] | None = None, messages: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     rows = build_case_rows(cases, participants, messages)
     _write_rows_to_sheet(service, spreadsheet_id, CASE_SHEET_NAME, rows)
-    _apply_approval_status_formatting(service, spreadsheet_id, CASE_SHEET_NAME)
-    _set_case_column_widths(service, spreadsheet_id, CASE_SHEET_NAME)
     return {"sheet": CASE_SHEET_NAME, "row_count": len(rows) - 1}
 
 
@@ -505,28 +542,31 @@ def sync_all_to_google_sheets(service: Any | None = None, spreadsheet_id: str | 
 
     client = get_supabase_client()
     cases = get_cases(client=client)
-    participants_rows: list[dict[str, Any]] = []
-    messages_rows: list[dict[str, Any]] = []
+    covering_numbers = {str(case.get("id")): str(case.get("covering_number") or "") for case in cases}
+    participants_rows = []
+    for participant in get_participants(client=client, all_cases=True):
+        enriched = dict(participant)
+        enriched["covering_number"] = covering_numbers.get(str(participant.get("case_id") or ""), "")
+        participants_rows.append(enriched)
 
-    for case in cases:
-        case_id = case.get("id")
-        covering_number = str(case.get("covering_number") or "")
+    messages_by_case: dict[str, list[dict[str, Any]]] = {}
+    messages_rows = []
+    for message in get_messages(client=client, all_cases=True):
+        enriched = dict(message)
+        case_id = str(message.get("case_id") or "")
+        enriched["covering_number"] = covering_numbers.get(case_id, "")
+        messages_rows.append(enriched)
+        messages_by_case.setdefault(case_id, []).append(enriched)
 
-        participants = get_participants(client=client, case_id=case_id)
-        for participant in participants:
-            enriched = dict(participant)
-            enriched["covering_number"] = covering_number
-            participants_rows.append(enriched)
-
-        messages = get_messages(client=client, case_id=case_id)
-        for message in messages:
-            enriched = dict(message)
-            enriched["covering_number"] = covering_number
-            messages_rows.append(enriched)
-
-    _delete_legacy_sheets(service, spreadsheet_id)
     sync_cases_to_sheet(service, spreadsheet_id, cases, participants_rows, messages_rows)
-    _write_case_history_sheet(service, spreadsheet_id, cases, client=client)
+    _write_case_history_sheet(service, spreadsheet_id, cases, messages_by_case)
+
+    global _legacy_cleanup_checked
+    if not _legacy_cleanup_checked:
+        _apply_approval_status_formatting(service, spreadsheet_id, CASE_SHEET_NAME)
+        _set_case_column_widths(service, spreadsheet_id, CASE_SHEET_NAME)
+        _delete_legacy_sheets(service, spreadsheet_id)
+        _legacy_cleanup_checked = True
 
     response = service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
     titles = [sheet["properties"]["title"] for sheet in response.get("sheets", []) if "properties" in sheet and "title" in sheet["properties"]]
