@@ -37,6 +37,16 @@ def post_webhook(client, payload, **kwargs):
     return client.post("/webhook/whapi", json=payload, **kwargs)
 
 
+def test_render_application_startup_invokes_existing_worker(monkeypatch):
+    started = []
+    monkeypatch.setenv("RENDER", "true")
+    monkeypatch.setattr(whapi_webhook, "start_worker", lambda: started.append(True))
+
+    whapi_webhook._start_worker_on_app_startup()
+
+    assert started == [True]
+
+
 def test_valid_incoming_group_text_message(monkeypatch):
     monkeypatch.setenv("WHAPI_GROUP_ID", "120363431619768061@g.us")
     monkeypatch.setenv("WHAPI_CHANNEL_ID", "channel_abc")

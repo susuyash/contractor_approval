@@ -192,5 +192,13 @@ def whapi_webhook() -> tuple[str, int]:
     return "", 200
 
 
+def _start_worker_on_app_startup() -> None:
+    if os.getenv("RENDER") == "true":
+        start_worker()
+
+
+_start_worker_on_app_startup()
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
