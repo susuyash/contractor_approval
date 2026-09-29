@@ -126,6 +126,7 @@ def test_creates_new_covering_case():
 
     assert result["covering_number"] == "300"
     assert client.cases.records[1]["covering_number"] == "300"
+    assert result["description"] == "contractor payment"
 
 
 def test_updates_existing_covering_case():
@@ -143,6 +144,42 @@ def test_updates_existing_covering_case():
 
     assert result["covering_number"] == "259"
     assert result["overall_status"] == OverallStatus.PENDING.value
+    assert result["description"] == "contractor payment"
+
+
+def test_later_ai_description_does_not_replace_original_and_fifth_approval_still_works():
+    client = FakeClient()
+    client.participants.records = [
+        {"case_id": "case-1", "person": person, "status": ParticipantStatus.APPROVED.value, "last_message": "Approved"}
+        for person in ["Mukesh", "Mehta Sir", "Jagga Rao", "Gagan Deep Singh"]
+    ]
+    interpretation = CaseInterpretation.model_validate(
+        {
+            "covering_number": "259",
+            "description": "Approval message mistaken for a case description",
+            "urgency": "NORMAL",
+            "participants": [{"person": "Deep Patel", "status": "APPROVED", "last_message": "Approved"}],
+            "overall_status": "APPROVED",
+        }
+    )
+
+    result = save_case(
+        client,
+        {
+            "covering_number": "259",
+            "description": interpretation.description,
+            "participants": [participant.model_dump() for participant in interpretation.participants],
+            "messages": [{"sender": "Deep Patel", "text": "Covering 259 approved by Deep sir", "timestamp": "2024-01-02T09:10:00Z"}],
+        },
+        interpretation,
+    )
+
+    assert result["description"] == "contractor payment"
+    assert result["overall_status"] == OverallStatus.APPROVED.value
+    assert any(
+        participant["person"] == "Deep Patel" and participant["status"] == ParticipantStatus.APPROVED.value
+        for participant in client.participants.records
+    )
 
 
 def test_saves_participants():

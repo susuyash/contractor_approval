@@ -245,7 +245,7 @@ def _resolve_case_payload(case_data: dict[str, Any], interpretation: Any | None 
     }
 
 
-def get_or_create_case(client: Any, covering_number: str) -> dict[str, Any]:
+def get_or_create_case(client: Any, covering_number: str, description: str | None = None) -> dict[str, Any]:
     rows = client.table("cases").select("*").eq("covering_number", covering_number).execute()
     data = _unwrap_rows(rows)
     if data:
@@ -253,7 +253,7 @@ def get_or_create_case(client: Any, covering_number: str) -> dict[str, Any]:
 
     record = {
         "covering_number": covering_number,
-        "description": None,
+        "description": description,
         "urgency": None,
         "raised_by": None,
         "overall_status": OverallStatus.UNKNOWN.value,
@@ -271,11 +271,15 @@ def upsert_case(client: Any, case_data: dict[str, Any], interpretation: Any | No
     resolved = _resolve_case_payload(case_data, interpretation)
     incoming_case = resolved["case"]
 
-    existing = get_or_create_case(client, incoming_case["covering_number"])
+    existing = get_or_create_case(
+        client,
+        incoming_case["covering_number"],
+        description=incoming_case.get("description"),
+    )
     merged = {
         "id": existing.get("id"),
         "covering_number": incoming_case["covering_number"],
-        "description": _merge_optional_value(existing.get("description"), incoming_case.get("description")),
+        "description": existing.get("description"),
         "urgency": _merge_optional_value(existing.get("urgency"), incoming_case.get("urgency")),
         "raised_by": _merge_optional_value(existing.get("raised_by"), incoming_case.get("raised_by")),
         "overall_status": incoming_case["overall_status"],
