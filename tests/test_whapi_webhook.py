@@ -27,6 +27,31 @@ VALID_GROUP_MESSAGE = {
     "channel_id": "channel_abc",
 }
 
+PRODUCTION_REPLY_MESSAGE = {
+    "id": "Khz4YyPoikvaFQ-gjwBq53aoxas5A",
+    "from_me": False,
+    "type": "text",
+    "timestamp": 1790789328,
+    "chat_id": "120363377420053732@g.us",
+    "from": "917415669222",
+    "text": {"body": "Approved"},
+    "context": {
+        "quoted_id": "PrDkYyf2HdZ0bUk-gpMBq53aoxas5A",
+        "quoted_author": "undefined@s.whatsapp.net",
+        "quoted_content": {
+            "id": "media_init",
+            "mime_type": "application/pdf",
+            "file_size": 142337,
+            "sha256": "oRPUKnrqRc+rO0m0DUqk1L1RbF14nGCZ8W8scvmnbWQ=",
+            "file_name": "COVERING NO_303.pdf",
+            "caption": "@55452876406938 @224790166155352 @244619963039799 @172331402051807 @194029593600080 , Respected Sir, Kindly approve the payment Covering No.303 for urgent payment of contractors",
+            "filename": "COVERING NO_303.pdf",
+        },
+        "quoted_type": "document",
+    },
+    "from_name": "Deep Patel",
+}
+
 
 @pytest.fixture(autouse=True)
 def configure_webhook(monkeypatch):
@@ -278,3 +303,84 @@ def test_inbox_failure_returns_retryable_status_without_logging_secrets(monkeypa
     response = post_webhook(app.test_client(), VALID_GROUP_MESSAGE)
 
     assert response.status_code == 503
+
+
+def test_real_whapi_reply_context_enqueues_covering_303_and_persists_context(monkeypatch):
+    monkeypatch.setenv("WHAPI_GROUP_ID", "120363377420053732@g.us")
+    enqueued = []
+    saved = []
+    interpretation = CaseInterpretation.model_validate(
+        {
+            "covering_number": "303",
+            "description": None,
+            "urgency": "UNKNOWN",
+            "participants": [{"person": "Deep Patel", "status": "APPROVED", "last_message": "Approved"}],
+            "overall_status": "PENDING",
+        }
+    )
+    monkeypatch.setattr(whapi_webhook, "get_supabase_client", lambda: object())
+    monkeypatch.setattr(
+        whapi_webhook,
+        "enqueue_webhook_message",
+        lambda _client, event_key, message: enqueued.append((event_key, message)) or True,
+    )
+    monkeypatch.setattr(whapi_webhook, "wake_worker", lambda: None)
+    monkeypatch.setattr(whapi_webhook, "interpret_cases", lambda _cases: [interpretation])
+    monkeypatch.setattr(whapi_webhook, "save_case", lambda _client, payload, _interpretation: saved.append(payload))
+
+    accepted = whapi_webhook.ingest_whapi_message(
+        {"event": {"type": "messages", "event": "post"}, "messages": [PRODUCTION_REPLY_MESSAGE]}
+    )
+    normalized = enqueued[0][1]
+    cases = whapi_webhook._extract_message_cases(whapi_webhook.adapt_whapi_message_to_case_pipeline(normalized))
+    whapi_webhook.process_whapi_case(normalized)
+
+    assert len(accepted) == 1
+    assert cases[0]["covering_number"] == "303"
+    assert normalized["context"] == PRODUCTION_REPLY_MESSAGE["context"]
+    assert saved[0]["covering_number"] == "303"
+    assert saved[0]["messages"][0]["text"].startswith("Approved\n[Quoted context]")
+    assert "COVERING NO_303.pdf" in saved[0]["messages"][0]["text"]
+
+
+def test_reply_context_covering_number_is_not_hardcoded(monkeypatch):
+    monkeypatch.setenv("WHAPI_GROUP_ID", "120363377420053732@g.us")
+    message = {
+        **PRODUCTION_REPLY_MESSAGE,
+        "id": "reply-4567",
+        "text": {"body": "Approved"},
+        "context": {"quoted_content": {"body": "Covering No. 4567 payment approval"}},
+    }
+    enqueued = []
+    monkeypatch.setattr(whapi_webhook, "get_supabase_client", lambda: object())
+    monkeypatch.setattr(
+        whapi_webhook,
+        "enqueue_webhook_message",
+        lambda _client, _event_key, normalized: enqueued.append(normalized) or True,
+    )
+    monkeypatch.setattr(whapi_webhook, "wake_worker", lambda: None)
+
+    accepted = whapi_webhook.ingest_whapi_message(
+        {"event": {"type": "messages", "event": "post"}, "messages": [message]}
+    )
+    cases = whapi_webhook._extract_message_cases(whapi_webhook.adapt_whapi_message_to_case_pipeline(enqueued[0]))
+
+    assert len(accepted) == 1
+    assert cases[0]["covering_number"] == "4567"
+
+
+def test_unrelated_reply_without_covering_number_is_ignored(monkeypatch):
+    monkeypatch.setenv("WHAPI_GROUP_ID", "120363377420053732@g.us")
+    message = {
+        **PRODUCTION_REPLY_MESSAGE,
+        "id": "reply-unrelated",
+        "text": {"body": "Looks good"},
+        "context": {"quoted_content": {"body": "Please check the attached document"}},
+    }
+    monkeypatch.setattr(whapi_webhook, "get_supabase_client", lambda: pytest.fail("unrelated message accessed Supabase"))
+
+    accepted = whapi_webhook.ingest_whapi_message(
+        {"event": {"type": "messages", "event": "post"}, "messages": [message]}
+    )
+
+    assert accepted == []

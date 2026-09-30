@@ -2,6 +2,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 from datetime import datetime, timezone
 from typing import Any
 
@@ -73,6 +74,7 @@ def _normalize_message(message: dict[str, Any]) -> dict[str, Any] | None:
         "chat_id": chat_id,
         "chat_name": message.get("chat_name"),
         "message": str(body),
+        "context": message.get("context"),
         "source": "whapi",
     }
 
@@ -99,11 +101,44 @@ def adapt_whapi_message_to_case_pipeline(normalized: dict[str, Any]) -> dict[str
         "timestamp": timestamp,
         "sender": sender,
         "text": text,
+        "context": normalized.get("context"),
     }
 
 
+def _extract_message_cases(pipeline_message: dict[str, Any]) -> list[dict[str, Any]]:
+    cases = extract_covering_cases([pipeline_message])
+    if cases:
+        return cases
+
+    context = pipeline_message.get("context")
+    quoted_content = context.get("quoted_content") if isinstance(context, dict) else None
+    if not isinstance(quoted_content, dict):
+        return []
+
+    quoted_text = "\n".join(
+        str(quoted_content.get(field))
+        for field in ("body", "caption", "file_name", "filename")
+        if quoted_content.get(field)
+    )
+    if not quoted_text:
+        return []
+
+    quoted_text = re.sub(r"\bno\.(?=\s*\d)", "no ", quoted_text, flags=re.IGNORECASE)
+    cases = extract_covering_cases([{**pipeline_message, "text": quoted_text}])
+    for case in cases:
+        case["messages"] = [pipeline_message]
+    return cases
+
+
 def _build_case_payload(case: dict[str, Any], interpretation: Any) -> dict[str, Any]:
-    messages = case.get("messages", [])
+    messages = []
+    for message in case.get("messages", []):
+        persisted_message = dict(message)
+        context = persisted_message.get("context")
+        if isinstance(context, dict):
+            text = str(persisted_message.get("text") or "")
+            persisted_message["text"] = f"{text}\n[Quoted context] {json.dumps(context, ensure_ascii=False, sort_keys=True)}"
+        messages.append(persisted_message)
     return {
         "covering_number": case.get("covering_number"),
         "description": getattr(interpretation, "description", None),
@@ -122,7 +157,7 @@ def process_whapi_case(normalized: dict[str, Any]) -> list[Any]:
     if pipeline_message is None:
         return []
 
-    cases = extract_covering_cases([pipeline_message])
+    cases = _extract_message_cases(pipeline_message)
     if not cases:
         return []
 
@@ -165,7 +200,7 @@ def ingest_whapi_message(payload: Any) -> list[dict[str, Any]]:
             continue
 
         pipeline_message = adapt_whapi_message_to_case_pipeline(normalized)
-        if pipeline_message is None or not extract_covering_cases([pipeline_message]):
+        if pipeline_message is None or not _extract_message_cases(pipeline_message):
             continue
 
         client = get_supabase_client()
