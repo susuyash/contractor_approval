@@ -1,5 +1,7 @@
+import json
 import threading
 import time
+from pathlib import Path
 
 import pytest
 
@@ -384,3 +386,28 @@ def test_unrelated_reply_without_covering_number_is_ignored(monkeypatch):
     )
 
     assert accepted == []
+
+
+def test_raw_reply_fixture_is_enqueued_by_webhook_route(monkeypatch):
+    payload_path = Path(__file__).resolve().parents[1] / "test_reply_8472.json"
+    payload = json.loads(payload_path.read_text(encoding="utf-8"))
+    monkeypatch.setenv("WHAPI_GROUP_ID", payload["chat_id"])
+    enqueued = []
+    monkeypatch.setattr(whapi_webhook, "get_supabase_client", lambda: object())
+    monkeypatch.setattr(
+        whapi_webhook,
+        "enqueue_webhook_message",
+        lambda _client, event_key, normalized: enqueued.append((event_key, normalized)) or True,
+    )
+    monkeypatch.setattr(whapi_webhook, "wake_worker", lambda: None)
+
+    response = post_webhook(app.test_client(), payload)
+
+    assert response.status_code == 200
+    assert len(enqueued) == 1
+    assert enqueued[0][0] == f"{payload['chat_id']}:{payload['id']}"
+    normalized = enqueued[0][1]
+    cases = whapi_webhook._extract_message_cases(
+        whapi_webhook.adapt_whapi_message_to_case_pipeline(normalized)
+    )
+    assert cases[0]["covering_number"] == "8472"

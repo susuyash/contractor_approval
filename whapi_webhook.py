@@ -182,14 +182,17 @@ def ingest_whapi_message(payload: Any) -> list[dict[str, Any]]:
     if not isinstance(payload, dict):
         return []
 
-    event = payload.get("event")
-    if not isinstance(event, dict):
-        return []
+    if "event" not in payload:
+        messages = [payload]
+    else:
+        event = payload.get("event")
+        if not isinstance(event, dict):
+            return []
 
-    if event.get("type") != "messages" or event.get("event") != "post":
-        return []
+        if event.get("type") != "messages" or event.get("event") != "post":
+            return []
 
-    messages = payload.get("messages")
+        messages = payload.get("messages")
     if not isinstance(messages, list):
         return []
 
